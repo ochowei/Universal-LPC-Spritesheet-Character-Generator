@@ -192,6 +192,7 @@ jobs:
             COPYING.txt \
             ATTRIBUTION.md \
             CREDITS.md \
+            CREDITS.csv \
             AUTHORS.md
           do
             if [ -f "$file" ]; then

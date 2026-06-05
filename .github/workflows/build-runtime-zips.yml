@@ -1,0 +1,247 @@
+name: Build LPC runtime zips
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Release tag, e.g. assets-v2026.06.05"
+        required: false
+        type: string
+      release_name:
+        description: "Release name"
+        required: false
+        type: string
+      source_dir:
+        description: "Spritesheet source directory"
+        required: false
+        default: "spritesheets"
+        type: string
+      prerelease:
+        description: "Mark release as prerelease"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  build-runtime-zips:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Resolve release metadata
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SHORT_SHA="${GITHUB_SHA::7}"
+
+          if [ -n "${{ inputs.release_tag }}" ]; then
+            TAG="${{ inputs.release_tag }}"
+          else
+            TAG="assets-v$(date -u +'%Y.%m.%d')-${SHORT_SHA}"
+          fi
+
+          if [ -n "${{ inputs.release_name }}" ]; then
+            NAME="${{ inputs.release_name }}"
+          else
+            NAME="LPC runtime zips ${TAG}"
+          fi
+
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "name=${NAME}" >> "$GITHUB_OUTPUT"
+          echo "short_sha=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Locate spritesheet source directory
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          REQUESTED="${{ inputs.source_dir }}"
+
+          if [ -d "$REQUESTED" ]; then
+            SRC="$REQUESTED"
+          elif [ -d "assets/spritesheets" ]; then
+            SRC="assets/spritesheets"
+          elif [ -d "spritesheets" ]; then
+            SRC="spritesheets"
+          else
+            echo "Could not find spritesheet source directory."
+            echo "Tried:"
+            echo "- $REQUESTED"
+            echo "- assets/spritesheets"
+            echo "- spritesheets"
+            exit 1
+          fi
+
+          echo "src=${SRC}" >> "$GITHUB_OUTPUT"
+          echo "Using source directory: ${SRC}"
+
+      - name: Build runtime zips
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SRC="${{ steps.source.outputs.src }}"
+          OUT="dist/lpc-runtime-zips"
+          ZIP_OUT="${OUT}/zips"
+
+          rm -rf dist
+          mkdir -p "$ZIP_OUT"
+
+          echo "Source: $SRC"
+          echo "Output: $ZIP_OUT"
+
+          # Pack each top-level directory as one zip.
+          # Example:
+          # spritesheets/body/...  -> zips/body.zip
+          # spritesheets/hair/...  -> zips/hair.zip
+          find "$SRC" -mindepth 1 -maxdepth 1 -type d | sort | while read -r dir; do
+            name="$(basename "$dir")"
+            echo "Packing $name.zip"
+
+            (
+              cd "$dir"
+              zip -qr "../../../../${ZIP_OUT}/${name}.zip" .
+            )
+          done
+
+          # Also pack top-level PNG files if the source dir has any.
+          # They go into _root.zip.
+          ROOT_PNG_COUNT="$(find "$SRC" -maxdepth 1 -type f \( -iname '*.png' -o -iname '*.webp' -o -iname '*.jpg' -o -iname '*.jpeg' \) | wc -l | tr -d ' ')"
+
+          if [ "$ROOT_PNG_COUNT" != "0" ]; then
+            echo "Packing _root.zip for top-level image files"
+            (
+              cd "$SRC"
+              find . -maxdepth 1 -type f \( -iname '*.png' -o -iname '*.webp' -o -iname '*.jpg' -o -iname '*.jpeg' \) -print0 \
+                | xargs -0 zip -q "../../${ZIP_OUT}/_root.zip"
+            )
+          fi
+
+          echo "Generated zips:"
+          ls -lh "$ZIP_OUT"
+
+      - name: Generate asset manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          OUT="dist/lpc-runtime-zips"
+          ZIP_OUT="${OUT}/zips"
+          MANIFEST="${OUT}/asset-manifest.json"
+
+          node <<'NODE'
+          const fs = require("fs");
+          const path = require("path");
+          const crypto = require("crypto");
+
+          const out = "dist/lpc-runtime-zips";
+          const zipOut = path.join(out, "zips");
+          const manifestPath = path.join(out, "asset-manifest.json");
+
+          const files = fs.readdirSync(zipOut)
+            .filter((file) => file.endsWith(".zip"))
+            .sort()
+            .map((file) => {
+              const fullPath = path.join(zipOut, file);
+              const data = fs.readFileSync(fullPath);
+              return {
+                path: `zips/${file}`,
+                sizeBytes: data.length,
+                sha256: crypto.createHash("sha256").update(data).digest("hex"),
+              };
+            });
+
+          const manifest = {
+            format: "lpc-runtime-zips",
+            sourceRepository: process.env.GITHUB_REPOSITORY,
+            sourceRef: process.env.GITHUB_REF_NAME,
+            sourceSha: process.env.GITHUB_SHA,
+            generatedAt: new Date().toISOString(),
+            files,
+          };
+
+          fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + "\n");
+          console.log(JSON.stringify(manifest, null, 2));
+          NODE
+
+      - name: Add license and attribution files if present
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          OUT="dist/lpc-runtime-zips"
+          mkdir -p "$OUT"
+
+          for file in \
+            LICENSE \
+            LICENSE.md \
+            COPYING \
+            COPYING.txt \
+            ATTRIBUTION.md \
+            CREDITS.md \
+            AUTHORS.md
+          do
+            if [ -f "$file" ]; then
+              cp "$file" "$OUT/"
+            fi
+          done
+
+          if [ -d "licenses" ]; then
+            cp -R "licenses" "$OUT/licenses"
+          fi
+
+          if [ -d "LICENSES" ]; then
+            cp -R "LICENSES" "$OUT/LICENSES"
+          fi
+
+      - name: Create archive and checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd dist
+
+          tar -czf lpc-runtime-zips.tar.gz lpc-runtime-zips
+
+          sha256sum lpc-runtime-zips.tar.gz > lpc-runtime-zips.tar.gz.sha256
+          sha256sum lpc-runtime-zips/asset-manifest.json > asset-manifest.json.sha256
+
+          echo "Archive:"
+          ls -lh lpc-runtime-zips.tar.gz
+
+          echo "Checksums:"
+          cat lpc-runtime-zips.tar.gz.sha256
+          cat asset-manifest.json.sha256
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lpc-runtime-zips
+          path: |
+            dist/lpc-runtime-zips.tar.gz
+            dist/lpc-runtime-zips.tar.gz.sha256
+            dist/lpc-runtime-zips/asset-manifest.json
+            dist/asset-manifest.json.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: ${{ steps.meta.outputs.name }}
+          prerelease: ${{ inputs.prerelease }}
+          generate_release_notes: true
+          files: |
+            dist/lpc-runtime-zips.tar.gz
+            dist/lpc-runtime-zips.tar.gz.sha256
+            dist/lpc-runtime-zips/asset-manifest.json
+            dist/asset-manifest.json.sha256

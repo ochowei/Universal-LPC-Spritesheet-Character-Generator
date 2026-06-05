@@ -150,50 +150,6 @@ jobs:
           echo "Generated zips:"
           ls -lh "$ZIP_OUT_ABS"
 
-      - name: Generate asset manifest
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          OUT="dist/lpc-runtime-zips"
-          ZIP_OUT="${OUT}/zips"
-          MANIFEST="${OUT}/asset-manifest.json"
-
-          node <<'NODE'
-          const fs = require("fs");
-          const path = require("path");
-          const crypto = require("crypto");
-
-          const out = "dist/lpc-runtime-zips";
-          const zipOut = path.join(out, "zips");
-          const manifestPath = path.join(out, "asset-manifest.json");
-
-          const files = fs.readdirSync(zipOut)
-            .filter((file) => file.endsWith(".zip"))
-            .sort()
-            .map((file) => {
-              const fullPath = path.join(zipOut, file);
-              const data = fs.readFileSync(fullPath);
-              return {
-                path: `zips/${file}`,
-                sizeBytes: data.length,
-                sha256: crypto.createHash("sha256").update(data).digest("hex"),
-              };
-            });
-
-          const manifest = {
-            format: "lpc-runtime-zips",
-            sourceRepository: process.env.GITHUB_REPOSITORY,
-            sourceRef: process.env.GITHUB_REF_NAME,
-            sourceSha: process.env.GITHUB_SHA,
-            generatedAt: new Date().toISOString(),
-            files,
-          };
-
-          fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + "\n");
-          console.log(JSON.stringify(manifest, null, 2));
-          NODE
-
       - name: Add license and attribution files if present
         shell: bash
         run: |
@@ -240,6 +196,61 @@ jobs:
           if [ -d "palette_definitions" ]; then
             cp -R "palette_definitions" "$OUT/"
           fi
+
+      - name: Generate asset manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          OUT="dist/lpc-runtime-zips"
+          ZIP_OUT="${OUT}/zips"
+          MANIFEST="${OUT}/asset-manifest.json"
+
+          node <<'NODE'
+          const fs = require("fs");
+          const path = require("path");
+          const crypto = require("crypto");
+
+          const out = "dist/lpc-runtime-zips";
+          const zipOut = path.join(out, "zips");
+          const manifestPath = path.join(out, "asset-manifest.json");
+
+          const files = fs.readdirSync(zipOut)
+            .filter((file) => file.endsWith(".zip"))
+            .sort()
+            .map((file) => {
+              const fullPath = path.join(zipOut, file);
+              const data = fs.readFileSync(fullPath);
+              return {
+                path: `zips/${file}`,
+                sizeBytes: data.length,
+                sha256: crypto.createHash("sha256").update(data).digest("hex"),
+              };
+            });
+
+          // Include CREDITS.csv in the manifest if it exists
+          const creditsPath = path.join(out, "CREDITS.csv");
+          if (fs.existsSync(creditsPath)) {
+            const data = fs.readFileSync(creditsPath);
+            files.push({
+              path: "CREDITS.csv",
+              sizeBytes: data.length,
+              sha256: crypto.createHash("sha256").update(data).digest("hex"),
+            });
+          }
+
+          const manifest = {
+            format: "lpc-runtime-zips",
+            sourceRepository: process.env.GITHUB_REPOSITORY,
+            sourceRef: process.env.GITHUB_REF_NAME,
+            sourceSha: process.env.GITHUB_SHA,
+            generatedAt: new Date().toISOString(),
+            files,
+          };
+
+          fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + "\n");
+          console.log(JSON.stringify(manifest, null, 2));
+          NODE
 
       - name: Create archive and checksums
         shell: bash

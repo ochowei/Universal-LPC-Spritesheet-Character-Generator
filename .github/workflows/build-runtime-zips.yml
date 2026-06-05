@@ -130,6 +130,23 @@ jobs:
             )
           fi
 
+          # Pack sheet_definitions and palette_definitions if present
+          if [ -d "sheet_definitions" ]; then
+            echo "Packing sheet_definitions.zip"
+            (
+              cd "sheet_definitions"
+              zip -qr "${ZIP_OUT_ABS}/sheet_definitions.zip" .
+            )
+          fi
+
+          if [ -d "palette_definitions" ]; then
+            echo "Packing palette_definitions.zip"
+            (
+              cd "palette_definitions"
+              zip -qr "${ZIP_OUT_ABS}/palette_definitions.zip" .
+            )
+          fi
+
           echo "Generated zips:"
           ls -lh "$ZIP_OUT_ABS"
 
@@ -206,6 +223,22 @@ jobs:
 
           if [ -d "LICENSES" ]; then
             cp -R "LICENSES" "$OUT/LICENSES"
+          fi
+
+      - name: Add sheet and palette definitions if present
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          OUT="dist/lpc-runtime-zips"
+          mkdir -p "$OUT"
+
+          if [ -d "sheet_definitions" ]; then
+            cp -R "sheet_definitions" "$OUT/"
+          fi
+
+          if [ -d "palette_definitions" ]; then
+            cp -R "palette_definitions" "$OUT/"
           fi
 
       - name: Create archive and checksums

@@ -91,42 +91,47 @@ jobs:
           SRC="${{ steps.source.outputs.src }}"
           OUT="dist/lpc-runtime-zips"
           ZIP_OUT="${OUT}/zips"
+          ZIP_OUT_ABS="${GITHUB_WORKSPACE}/${ZIP_OUT}"
 
           rm -rf dist
-          mkdir -p "$ZIP_OUT"
+          mkdir -p "$ZIP_OUT_ABS"
 
           echo "Source: $SRC"
           echo "Output: $ZIP_OUT"
 
           # Pack each top-level directory as one zip.
           # Example:
-          # spritesheets/body/...  -> zips/body.zip
-          # spritesheets/hair/...  -> zips/hair.zip
+          # spritesheets/arms/... -> zips/arms.zip
+          #
+          # Important:
+          # We cd into each category directory so the zip contains the files
+          # under that category, not the outer spritesheets/<category> prefix.
           find "$SRC" -mindepth 1 -maxdepth 1 -type d | sort | while read -r dir; do
             name="$(basename "$dir")"
-            echo "Packing $name.zip"
+            echo "Packing ${name}.zip"
 
             (
               cd "$dir"
-              zip -qr "../../../../${ZIP_OUT}/${name}.zip" .
+              zip -qr "${ZIP_OUT_ABS}/${name}.zip" .
             )
           done
 
-          # Also pack top-level PNG files if the source dir has any.
+          # Also pack top-level image files if the source dir has any.
           # They go into _root.zip.
-          ROOT_PNG_COUNT="$(find "$SRC" -maxdepth 1 -type f \( -iname '*.png' -o -iname '*.webp' -o -iname '*.jpg' -o -iname '*.jpeg' \) | wc -l | tr -d ' ')"
+          ROOT_IMAGE_COUNT="$(find "$SRC" -maxdepth 1 -type f \( -iname '*.png' -o -iname '*.webp' -o -iname '*.jpg' -o -iname '*.jpeg' \) | wc -l | tr -d ' ')"
 
-          if [ "$ROOT_PNG_COUNT" != "0" ]; then
+          if [ "$ROOT_IMAGE_COUNT" != "0" ]; then
             echo "Packing _root.zip for top-level image files"
+
             (
               cd "$SRC"
               find . -maxdepth 1 -type f \( -iname '*.png' -o -iname '*.webp' -o -iname '*.jpg' -o -iname '*.jpeg' \) -print0 \
-                | xargs -0 zip -q "../../${ZIP_OUT}/_root.zip"
+                | xargs -0 zip -q "${ZIP_OUT_ABS}/_root.zip"
             )
           fi
 
           echo "Generated zips:"
-          ls -lh "$ZIP_OUT"
+          ls -lh "$ZIP_OUT_ABS"
 
       - name: Generate asset manifest
         shell: bash

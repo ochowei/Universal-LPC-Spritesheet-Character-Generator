@@ -1,0 +1,817 @@
+name: Build LPC runtime zips v2
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Unique release tag, e.g. assets-v2026.08.01-color-links-v1"
+        required: true
+        type: string
+      release_name:
+        description: "Release name"
+        required: false
+        type: string
+      source_dir:
+        description: "Spritesheet source directory"
+        required: false
+        default: "spritesheets"
+        type: string
+      prerelease:
+        description: "Mark release as prerelease"
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: lpc-runtime-assets-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-runtime-zips:
+    name: Build migrated runtime assets
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Resolve release metadata
+        id: meta
+        shell: bash
+        env:
+          RELEASE_TAG_INPUT: ${{ inputs.release_tag }}
+          RELEASE_NAME_INPUT: ${{ inputs.release_name }}
+        run: |
+          set -euo pipefail
+
+          TAG="$RELEASE_TAG_INPUT"
+
+          if [[ ! "$TAG" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            echo "Invalid release tag: $TAG"
+            exit 1
+          fi
+
+          if [ -n "$RELEASE_NAME_INPUT" ]; then
+            NAME="$RELEASE_NAME_INPUT"
+          else
+            NAME="LPC runtime zips ${TAG}"
+          fi
+
+          if [[ "$NAME" == *$'\n'* ]] || [[ "$NAME" == *$'\r'* ]]; then
+            echo "Release name must be one line."
+            exit 1
+          fi
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          echo "short_sha=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - name: Refuse an existing immutable release tag
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          git fetch --tags --force origin
+
+          if git show-ref --verify --quiet "refs/tags/$RELEASE_TAG"; then
+            echo "Release tag already exists: $RELEASE_TAG"
+            echo "Use a new tag; existing asset releases must remain immutable."
+            exit 1
+          fi
+
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "GitHub release already exists: $RELEASE_TAG"
+            exit 1
+          fi
+
+      - name: Locate spritesheet source directory
+        id: source
+        shell: bash
+        env:
+          REQUESTED_SOURCE_DIR: ${{ inputs.source_dir }}
+        run: |
+          set -euo pipefail
+
+          SRC=""
+
+          for candidate in \
+            "$REQUESTED_SOURCE_DIR" \
+            "assets/spritesheets" \
+            "spritesheets"
+          do
+            if [ -n "$candidate" ] && [ -d "$candidate" ]; then
+              SRC_ABS="$(realpath "$candidate")"
+
+              case "$SRC_ABS" in
+                "$GITHUB_WORKSPACE"/*)
+                  SRC="${SRC_ABS#"$GITHUB_WORKSPACE"/}"
+                  break
+                  ;;
+                *)
+                  echo "Spritesheet source escapes the repository: $candidate"
+                  exit 1
+                  ;;
+              esac
+            fi
+          done
+
+          if [ -z "$SRC" ]; then
+            echo "Could not find spritesheet source directory."
+            exit 1
+          fi
+
+          if [ ! -d "sheet_definitions" ]; then
+            echo "Missing sheet_definitions directory."
+            exit 1
+          fi
+
+          if [ ! -d "palette_definitions" ]; then
+            echo "Missing palette_definitions directory."
+            exit 1
+          fi
+
+          echo "src=$SRC" >> "$GITHUB_OUTPUT"
+          echo "Using source directory: $SRC"
+
+      - name: Prepare Toolkit runtime sheet definitions
+        id: migration
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          RUNTIME_DEFINITIONS="$RUNNER_TEMP/lpc-runtime-sheet-definitions"
+          MIGRATION_REPORT="$RUNNER_TEMP/color-channel-migration-report.json"
+
+          rm -rf "$RUNTIME_DEFINITIONS"
+          mkdir -p "$RUNTIME_DEFINITIONS"
+          cp -a "sheet_definitions/." "$RUNTIME_DEFINITIONS/"
+
+          echo "RUNTIME_SHEET_DEFINITIONS=$RUNTIME_DEFINITIONS" >> "$GITHUB_ENV"
+          echo "MIGRATION_REPORT_PATH=$MIGRATION_REPORT" >> "$GITHUB_ENV"
+
+          RUNTIME_SHEET_DEFINITIONS="$RUNTIME_DEFINITIONS" \
+          MIGRATION_REPORT_PATH="$MIGRATION_REPORT" \
+          node <<'NODE'
+          const fs = require("node:fs");
+          const path = require("node:path");
+
+          const root = process.env.RUNTIME_SHEET_DEFINITIONS;
+          const reportPath = process.env.MIGRATION_REPORT_PATH;
+
+          if (!root || !reportPath) {
+            throw new Error("Migration environment is incomplete.");
+          }
+
+          const EXPECTED_LEGACY = 79;
+          const EXPECTED_BODY = 1;
+          const EXPECTED_FOLLOWERS = 78;
+
+          const LINK = Object.freeze({
+            selection: "body",
+            channel: "primary",
+          });
+
+          const hasOwn = (value, key) =>
+            Object.prototype.hasOwnProperty.call(value, key);
+
+          const isObject = (value) =>
+            typeof value === "object" &&
+            value !== null &&
+            !Array.isArray(value);
+
+          function jsonFiles(directory) {
+            const files = [];
+
+            for (const entry of fs.readdirSync(directory, {
+              withFileTypes: true,
+            }).sort((a, b) => a.name.localeCompare(b.name))) {
+              const absolute = path.join(directory, entry.name);
+
+              if (entry.isSymbolicLink()) {
+                throw new Error(
+                  `Symbolic links are not allowed in runtime definitions: ${absolute}`,
+                );
+              }
+
+              if (entry.isDirectory()) {
+                files.push(...jsonFiles(absolute));
+              } else if (entry.isFile() && entry.name.endsWith(".json")) {
+                files.push(absolute);
+              }
+            }
+
+            return files;
+          }
+
+          function visit(value, visitor, jsonPath = "$") {
+            if (Array.isArray(value)) {
+              value.forEach((child, index) =>
+                visit(child, visitor, `${jsonPath}[${index}]`),
+              );
+              return;
+            }
+
+            if (!isObject(value)) {
+              return;
+            }
+
+            visitor(value, jsonPath);
+
+            for (const [key, child] of Object.entries(value)) {
+              visit(child, visitor, `${jsonPath}.${key}`);
+            }
+          }
+
+          function isRecolorConfig(value) {
+            return (
+              isObject(value) &&
+              typeof value.material === "string" &&
+              Array.isArray(value.palettes)
+            );
+          }
+
+          function recolorEntries(item) {
+            const recolors = item.recolors;
+
+            if (isRecolorConfig(recolors)) {
+              return [recolors];
+            }
+
+            if (!isObject(recolors)) {
+              return [];
+            }
+
+            return Object.keys(recolors)
+              .filter((key) => /^color_[1-9][0-9]*$/.test(key))
+              .sort((left, right) => {
+                const leftNumber = Number(left.slice("color_".length));
+                const rightNumber = Number(right.slice("color_".length));
+                return leftNumber - rightNumber;
+              })
+              .map((key) => recolors[key])
+              .filter(isRecolorConfig);
+          }
+
+          function primaryRecolor(item, file, jsonPath) {
+            const entries = recolorEntries(item);
+
+            if (entries.length === 0) {
+              throw new Error(
+                `Legacy follower has no resolvable primary recolor: ${file} ${jsonPath}`,
+              );
+            }
+
+            return entries[0];
+          }
+
+          function sameLink(value) {
+            return (
+              isObject(value) &&
+              value.selection === LINK.selection &&
+              value.channel === LINK.channel &&
+              Object.keys(value).length === 2
+            );
+          }
+
+          const files = jsonFiles(root);
+          const changedFiles = new Set();
+
+          let legacyRemoved = 0;
+          let bodyFlagsRemoved = 0;
+          let followerLinksWritten = 0;
+
+          for (const file of files) {
+            let document;
+
+            try {
+              document = JSON.parse(fs.readFileSync(file, "utf8"));
+            } catch (error) {
+              throw new Error(
+                `Invalid JSON in ${file}: ${
+                  error instanceof Error ? error.message : String(error)
+                }`,
+              );
+            }
+
+            let changed = false;
+
+            visit(document, (item, jsonPath) => {
+              if (!hasOwn(item, "match_body_color")) {
+                return;
+              }
+
+              if (item.match_body_color !== true) {
+                throw new Error(
+                  `Unexpected match_body_color value in ${file} ${jsonPath}; expected true.`,
+                );
+              }
+
+              if (typeof item.type_name !== "string") {
+                throw new Error(
+                  `Legacy item has no type_name in ${file} ${jsonPath}.`,
+                );
+              }
+
+              delete item.match_body_color;
+              legacyRemoved += 1;
+              changed = true;
+
+              if (item.type_name === "body") {
+                bodyFlagsRemoved += 1;
+                return;
+              }
+
+              const primary = primaryRecolor(item, file, jsonPath);
+
+              if (
+                primary.linked_to !== undefined &&
+                !sameLink(primary.linked_to)
+              ) {
+                throw new Error(
+                  `Follower already has an incompatible linked_to in ${file} ${jsonPath}.`,
+                );
+              }
+
+              primary.linked_to = {
+                selection: LINK.selection,
+                channel: LINK.channel,
+              };
+              followerLinksWritten += 1;
+            });
+
+            if (changed) {
+              fs.writeFileSync(
+                file,
+                `${JSON.stringify(document, null, 2)}\n`,
+              );
+              changedFiles.add(path.relative(root, file));
+            }
+          }
+
+          if (legacyRemoved !== EXPECTED_LEGACY) {
+            throw new Error(
+              `Expected ${EXPECTED_LEGACY} legacy flags, migrated ${legacyRemoved}.`,
+            );
+          }
+
+          if (bodyFlagsRemoved !== EXPECTED_BODY) {
+            throw new Error(
+              `Expected ${EXPECTED_BODY} body legacy flag, migrated ${bodyFlagsRemoved}.`,
+            );
+          }
+
+          if (followerLinksWritten !== EXPECTED_FOLLOWERS) {
+            throw new Error(
+              `Expected ${EXPECTED_FOLLOWERS} followers, migrated ${followerLinksWritten}.`,
+            );
+          }
+
+          let remainingLegacy = 0;
+          let linkedToBodyPrimary = 0;
+          let bodySelfLinks = 0;
+
+          for (const file of files) {
+            const document = JSON.parse(fs.readFileSync(file, "utf8"));
+
+            visit(document, (item) => {
+              if (hasOwn(item, "match_body_color")) {
+                remainingLegacy += 1;
+              }
+
+              if (
+                typeof item.type_name !== "string" ||
+                !hasOwn(item, "recolors")
+              ) {
+                return;
+              }
+
+              for (const recolor of recolorEntries(item)) {
+                if (recolor.linked_to === undefined) {
+                  continue;
+                }
+
+                if (!sameLink(recolor.linked_to)) {
+                  throw new Error(
+                    `Unsupported linked_to target in ${file}.`,
+                  );
+                }
+
+                linkedToBodyPrimary += 1;
+
+                if (item.type_name === "body") {
+                  bodySelfLinks += 1;
+                }
+              }
+            });
+          }
+
+          if (remainingLegacy !== 0) {
+            throw new Error(
+              `Migration left ${remainingLegacy} match_body_color fields.`,
+            );
+          }
+
+          if (linkedToBodyPrimary !== EXPECTED_FOLLOWERS) {
+            throw new Error(
+              `Expected ${EXPECTED_FOLLOWERS} body/primary links, found ${linkedToBodyPrimary}.`,
+            );
+          }
+
+          if (bodySelfLinks !== 0) {
+            throw new Error(
+              `Migration produced ${bodySelfLinks} body self-links.`,
+            );
+          }
+
+          const report = {
+            schemaVersion: 1,
+            transformationId: "lpc-toolkit-linked-color-channels-v1",
+            sourceRepository: process.env.GITHUB_REPOSITORY,
+            inputSourceSha: process.env.GITHUB_SHA,
+            expected: {
+              legacyFlags: EXPECTED_LEGACY,
+              bodyFlags: EXPECTED_BODY,
+              followerLinks: EXPECTED_FOLLOWERS,
+            },
+            actual: {
+              legacyRemoved,
+              bodyFlagsRemoved,
+              followerLinksWritten,
+              remainingLegacy,
+              linkedToBodyPrimary,
+              bodySelfLinks,
+            },
+            changedFiles: [...changedFiles].sort(),
+          };
+
+          fs.writeFileSync(
+            reportPath,
+            `${JSON.stringify(report, null, 2)}\n`,
+          );
+
+          console.log(JSON.stringify(report, null, 2));
+          NODE
+
+      - name: Build runtime zips
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SRC="${{ steps.source.outputs.src }}"
+          OUT="dist/lpc-runtime-zips"
+          ZIP_OUT="$OUT/zips"
+          ZIP_OUT_ABS="$GITHUB_WORKSPACE/$ZIP_OUT"
+
+          rm -rf dist
+          mkdir -p "$ZIP_OUT_ABS"
+
+          echo "Source: $SRC"
+          echo "Runtime definitions: $RUNTIME_SHEET_DEFINITIONS"
+          echo "Output: $ZIP_OUT"
+
+          find "$SRC" -mindepth 1 -maxdepth 1 -type d \
+            | sort \
+            | while read -r dir
+          do
+            name="$(basename "$dir")"
+            echo "Packing ${name}.zip"
+
+            (
+              cd "$dir"
+              zip -X -qr "${ZIP_OUT_ABS}/${name}.zip" .
+            )
+          done
+
+          ROOT_IMAGE_COUNT="$(
+            find "$SRC" -maxdepth 1 -type f \
+              \( -iname '*.png' \
+              -o -iname '*.webp' \
+              -o -iname '*.jpg' \
+              -o -iname '*.jpeg' \) \
+              | wc -l \
+              | tr -d ' '
+          )"
+
+          if [ "$ROOT_IMAGE_COUNT" != "0" ]; then
+            echo "Packing _root.zip"
+
+            (
+              cd "$SRC"
+              find . -maxdepth 1 -type f \
+                \( -iname '*.png' \
+                -o -iname '*.webp' \
+                -o -iname '*.jpg' \
+                -o -iname '*.jpeg' \) \
+                -print0 \
+                | sort -z \
+                | xargs -0 zip -X -q "${ZIP_OUT_ABS}/_root.zip"
+            )
+          fi
+
+          echo "Packing migrated sheet_definitions.zip"
+
+          (
+            cd "$RUNTIME_SHEET_DEFINITIONS"
+            zip -X -qr "$ZIP_OUT_ABS/sheet_definitions.zip" .
+          )
+
+          echo "Packing palette_definitions.zip"
+
+          (
+            cd "palette_definitions"
+            zip -X -qr "$ZIP_OUT_ABS/palette_definitions.zip" .
+          )
+
+          echo "Generated zips:"
+          ls -lh "$ZIP_OUT_ABS"
+
+      - name: Verify packaged sheet definitions
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          VERIFY_ROOT="$RUNNER_TEMP/lpc-runtime-definition-verification"
+          rm -rf "$VERIFY_ROOT"
+          mkdir -p "$VERIFY_ROOT"
+
+          unzip -q \
+            "dist/lpc-runtime-zips/zips/sheet_definitions.zip" \
+            -d "$VERIFY_ROOT"
+
+          diff -qr "$RUNTIME_SHEET_DEFINITIONS" "$VERIFY_ROOT"
+
+          if grep -R --include='*.json' -n '"match_body_color"' "$VERIFY_ROOT"; then
+            echo "Packaged sheet definitions still contain match_body_color."
+            exit 1
+          fi
+
+          echo "Packaged definitions match the migrated staging tree."
+
+      - name: Add license and attribution files
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          OUT="dist/lpc-runtime-zips"
+          mkdir -p "$OUT"
+
+          for file in \
+            LICENSE \
+            LICENSE.md \
+            COPYING \
+            COPYING.txt \
+            ATTRIBUTION.md \
+            CREDITS.md \
+            CREDITS.csv \
+            AUTHORS.md
+          do
+            if [ -f "$file" ]; then
+              cp "$file" "$OUT/"
+            fi
+          done
+
+          if [ ! -f "$OUT/CREDITS.csv" ]; then
+            echo "CREDITS.csv is required."
+            exit 1
+          fi
+
+          if [ -d "licenses" ]; then
+            cp -R "licenses" "$OUT/licenses"
+          fi
+
+          if [ -d "LICENSES" ]; then
+            cp -R "LICENSES" "$OUT/LICENSES"
+          fi
+
+      - name: Add migrated definitions
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          OUT="dist/lpc-runtime-zips"
+
+          mkdir -p "$OUT/sheet_definitions"
+          cp -a \
+            "$RUNTIME_SHEET_DEFINITIONS/." \
+            "$OUT/sheet_definitions/"
+
+          cp -R "palette_definitions" "$OUT/"
+
+          cp \
+            "$MIGRATION_REPORT_PATH" \
+            "dist/color-channel-migration-report.json"
+
+      - name: Generate asset manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          node <<'NODE'
+          const fs = require("node:fs");
+          const path = require("node:path");
+          const crypto = require("node:crypto");
+
+          const out = "dist/lpc-runtime-zips";
+          const zipOut = path.join(out, "zips");
+          const manifestPath = path.join(out, "asset-manifest.json");
+          const reportPath = process.env.MIGRATION_REPORT_PATH;
+
+          if (!reportPath) {
+            throw new Error("MIGRATION_REPORT_PATH is missing.");
+          }
+
+          const migration = JSON.parse(
+            fs.readFileSync(reportPath, "utf8"),
+          );
+
+          if (migration.inputSourceSha !== process.env.GITHUB_SHA) {
+            throw new Error(
+              "Migration report source SHA does not match GITHUB_SHA.",
+            );
+          }
+
+          const files = fs.readdirSync(zipOut)
+            .filter((file) => file.endsWith(".zip"))
+            .sort()
+            .map((file) => {
+              const fullPath = path.join(zipOut, file);
+              const data = fs.readFileSync(fullPath);
+
+              return {
+                path: `zips/${file}`,
+                sizeBytes: data.length,
+                sha256: crypto
+                  .createHash("sha256")
+                  .update(data)
+                  .digest("hex"),
+              };
+            });
+
+          const creditsPath = path.join(out, "CREDITS.csv");
+          const credits = fs.readFileSync(creditsPath);
+
+          files.push({
+            path: "CREDITS.csv",
+            sizeBytes: credits.length,
+            sha256: crypto
+              .createHash("sha256")
+              .update(credits)
+              .digest("hex"),
+          });
+
+          const manifest = {
+            format: "lpc-runtime-zips",
+            sourceRepository: process.env.GITHUB_REPOSITORY,
+            sourceRef: process.env.GITHUB_REF_NAME,
+            sourceSha: process.env.GITHUB_SHA,
+            generatedAt: new Date().toISOString(),
+            transformation: {
+              schemaVersion: migration.schemaVersion,
+              id: migration.transformationId,
+              inputSourceSha: migration.inputSourceSha,
+              legacyRemoved: migration.actual.legacyRemoved,
+              bodyFlagsRemoved: migration.actual.bodyFlagsRemoved,
+              followerLinksWritten:
+                migration.actual.followerLinksWritten,
+              remainingLegacy: migration.actual.remainingLegacy,
+              bodySelfLinks: migration.actual.bodySelfLinks,
+            },
+            files,
+          };
+
+          fs.writeFileSync(
+            manifestPath,
+            `${JSON.stringify(manifest, null, 2)}\n`,
+          );
+
+          console.log(JSON.stringify(manifest, null, 2));
+          NODE
+
+      - name: Create archive and checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd dist
+
+          tar -czf lpc-runtime-zips.tar.gz lpc-runtime-zips
+
+          sha256sum \
+            lpc-runtime-zips.tar.gz \
+            > lpc-runtime-zips.tar.gz.sha256
+
+          sha256sum \
+            lpc-runtime-zips/asset-manifest.json \
+            > asset-manifest.json.sha256
+
+          echo "Archive:"
+          ls -lh lpc-runtime-zips.tar.gz
+
+          echo "Checksums:"
+          cat lpc-runtime-zips.tar.gz.sha256
+          cat asset-manifest.json.sha256
+
+      - name: Final release validation
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          tar -tzf dist/lpc-runtime-zips.tar.gz \
+            | grep -F "lpc-runtime-zips/zips/sheet_definitions.zip"
+
+          test -s dist/lpc-runtime-zips.tar.gz
+          test -s dist/lpc-runtime-zips/asset-manifest.json
+          test -s dist/color-channel-migration-report.json
+
+          node <<'NODE'
+          const fs = require("node:fs");
+
+          const manifest = JSON.parse(
+            fs.readFileSync(
+              "dist/lpc-runtime-zips/asset-manifest.json",
+              "utf8",
+            ),
+          );
+
+          const report = JSON.parse(
+            fs.readFileSync(
+              "dist/color-channel-migration-report.json",
+              "utf8",
+            ),
+          );
+
+          if (manifest.sourceSha !== process.env.GITHUB_SHA) {
+            throw new Error("Manifest sourceSha mismatch.");
+          }
+
+          if (
+            manifest.transformation?.id !==
+            "lpc-toolkit-linked-color-channels-v1"
+          ) {
+            throw new Error("Manifest transformation ID mismatch.");
+          }
+
+          if (report.actual.remainingLegacy !== 0) {
+            throw new Error("Migration report retains legacy flags.");
+          }
+
+          if (report.actual.followerLinksWritten !== 78) {
+            throw new Error("Migration report follower count mismatch.");
+          }
+
+          if (report.actual.bodySelfLinks !== 0) {
+            throw new Error("Migration report contains body self-links.");
+          }
+
+          console.log("Final release validation passed.");
+          NODE
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lpc-runtime-zips-${{ steps.meta.outputs.tag }}
+          path: |
+            dist/lpc-runtime-zips.tar.gz
+            dist/lpc-runtime-zips.tar.gz.sha256
+            dist/lpc-runtime-zips/asset-manifest.json
+            dist/asset-manifest.json.sha256
+            dist/color-channel-migration-report.json
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Create immutable GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: ${{ steps.meta.outputs.name }}
+          prerelease: ${{ inputs.prerelease }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          body: |
+            Toolkit runtime asset release.
+
+            Source commit: ${{ github.sha }}
+            Transformation: lpc-toolkit-linked-color-channels-v1
+            Legacy match_body_color fields removed: 79
+            body/primary follower links written: 78
+            Body self-links: 0
+          files: |
+            dist/lpc-runtime-zips.tar.gz
+            dist/lpc-runtime-zips.tar.gz.sha256
+            dist/lpc-runtime-zips/asset-manifest.json
+            dist/asset-manifest.json.sha256
+            dist/color-channel-migration-report.json
